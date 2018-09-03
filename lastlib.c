@@ -28,7 +28,8 @@ extern int __libc_start_main (int (*main) (int, char **, char ** MAIN_AUXVEC_DEC
                            void *stack_end);
 
 void *segment_address[] =
-  {&_start, &__data_start, &_edata, NULL, &foo, NULL, &__libc_start_main};
+  {&_start, &__data_start, &_edata, NULL, &foo,
+   NULL, &__libc_start_main, NULL, NULL, NULL};
   // If we didn't want to use sbrk(), then &_bss_start is also available.
 
 static void
@@ -95,9 +96,8 @@ void first_constructor()
 {
   static int firstTime = 1;
 
-  printf("First constructor here. We'll pass information to the parent.\n");
-
   if (firstTime) {
+    printf("First constructor here. We'll pass information to the parent.\n");
     firstTime = 0;
     // __libc_start_main (main=0x801c60 <main>, argc=1, argv=0x7fffffffd9d8, init=0x802a70 <__libc_csu_init>, fini=0x802b00 <__libc_csu_fini>, rtld_fini=0x0, stack_end=0x7fffffffd9c8);
     // _start();
@@ -124,13 +124,20 @@ void first_constructor()
       return;
     }
     segment_address[5] = (void*)(end - start);
+    segment_address[6] = &__libc_start_main;
+    segment_address[7] = &main;
+    segment_address[8] = &__libc_csu_init;
+    segment_address[9] = &__libc_csu_fini;
     int pipe_write = atoi(argv[1]);
     int addr_size = sizeof segment_address;
     write(pipe_write, &addr_size, sizeof addr_size);
     write(pipe_write, segment_address, addr_size);
     close(pipe_write);
     // Allow some time for parent to copy bits of child before we exit.
-    sleep(50);
+    sleep(10);
+    exit(0);
+  } else {
+    printf("Constructor called for the second time here. Running in the parent.\n");
   }
 }
 

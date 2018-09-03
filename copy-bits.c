@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <linux/limits.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 
 void read_proxy_bits(int childpid);
@@ -33,6 +34,14 @@ extern int __libc_start_main (int (*main) (int, char **, char ** MAIN_AUXVEC_DEC
 			    void (*fini) (void),
 			    void (*rtld_fini) (void),
 			    void *stack_end);
+
+typedef int (*libcFptr_t) (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
+			    int ,
+			    char **,
+			    __typeof (main) ,
+			    void (*fini) (void),
+			    void (*rtld_fini) (void),
+			    void *);
 
 static unsigned long
 getStackPtr()
@@ -127,9 +136,19 @@ int main(int argc, char **argv, char **envp)
   }
 
   read_proxy_bits(childpid);
+  waitpid(childpid, NULL, 0);
 
-  void (*foo)() = segment_address[4];
-  foo();
+  unsigned long stackStart = getStackPtr();
+    // NOTE: proc-stat returns the address of argc on the stack.
+    // argv[0] is 1 LP_SIZE ahead of argc, i.e., startStack + sizeof(void*)
+    // Stack End is 1 LP_SIZE behind argc, i.e., startStack - sizeof(void*)
+  // void (*foo)() = segment_address[4];
+  libcFptr_t fnc = segment_address[6];
+  fnc(segment_address[7], *(int*)stackStart,
+      (char**)(stackStart + sizeof(unsigned long)),
+      segment_address[8], segment_address[9], 0,
+      (void*)(stackStart - sizeof(unsigned long)));
+  // foo();
 
   return 0;
 }
