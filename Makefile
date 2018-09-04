@@ -1,7 +1,8 @@
 FILE=proxy.c
 CFLAGS=-g3 -O0
 PROXY_LINKER_FLAGS=-Wl,-Ttext-segment -Wl,0x800000 \
-                   -Wl,-Tdata -Wl,0xb00000
+                   -Wl,-Trodata-segment -Wl,0xb00000 \
+                   -Wl,-Tdata -Wl,0xd00000
 
 build: copy-bits proxy
 

@@ -10,6 +10,12 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <syscall.h>
+#include <sys/prctl.h>
+#include <asm/prctl.h>
+#include <link.h>
+#include <sys/auxv.h>
+#include <ucontext.h>
 
 void read_proxy_bits(int childpid);
 void mmap_iov(const struct iovec *iov, int prot);
@@ -98,6 +104,36 @@ getStackPtr()
   return startstack;
 }
 
+static unsigned long origPhnum;
+static unsigned long origPhdr;
+
+static void
+patchAuxv (ElfW(auxv_t) *av, unsigned long phnum, unsigned long phdr, int save)
+{
+  for (; av->a_type != AT_NULL; ++av) {
+    switch (av->a_type) {
+      case AT_PHNUM:
+        if (save) {
+          origPhnum = av->a_un.a_val;
+          av->a_un.a_val = phnum;
+        } else {
+          av->a_un.a_val = origPhnum;
+        }
+        break;
+      case AT_PHDR:
+        if (save) {
+         origPhdr = av->a_un.a_val;
+         av->a_un.a_val = phdr;
+        } else {
+          av->a_un.a_val = origPhdr;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 void *segment_address[100];
   // Will be read from child (from original proxy)
   // Values are:  {&_start, &__data_start, &_edata, sbrk(0), ...}
@@ -144,10 +180,44 @@ int main(int argc, char **argv, char **envp)
     // Stack End is 1 LP_SIZE behind argc, i.e., startStack - sizeof(void*)
   // void (*foo)() = segment_address[4];
   libcFptr_t fnc = segment_address[6];
-  fnc(segment_address[7], *(int*)stackStart,
-      (char**)(stackStart + sizeof(unsigned long)),
-      segment_address[8], segment_address[9], 0,
-      (void*)(stackStart - sizeof(unsigned long)));
+  unsigned long proxy_fs = (unsigned long)segment_address[14];
+  unsigned long app_fs;
+  int ret = syscall(SYS_arch_prctl, ARCH_GET_FS, &app_fs);
+  ret = syscall(SYS_arch_prctl, ARCH_SET_FS, proxy_fs);
+  fprintf(stderr, "proxy FS: 0x%x; app FS: 0x%x; ret: %d; "
+                  "Proxy PHNUM: %d; Proxy PHDR: 0x%x\n",
+          proxy_fs, app_fs, ret, segment_address[15], segment_address[16]);
+  if (ret < 0) {
+    perror("ARCH_SET_FS");
+  }
+  void *stack_end = (void*)(stackStart - sizeof(unsigned long));
+  char **ev = &argv[argc + 1];
+
+  ElfW(auxv_t) *auxvec;
+  {
+    char **evp = ev;
+    while (*evp++ != NULL)
+      ;
+    auxvec = (ElfW(auxv_t) *) evp;
+  }
+  patchAuxv(auxvec,
+            (unsigned long)segment_address[15],
+            (unsigned long)segment_address[16],
+            1);
+  int flag = 0;
+  ret = getcontext((ucontext_t*)segment_address[17]);
+  if (ret < 0) {
+    perror("getcontext");
+  }
+  if (!flag) {
+    flag = 1;
+    fnc(segment_address[7], argc, argv,
+        segment_address[8], segment_address[9], 0,
+        stack_end);
+  }
+  fprintf(stderr, "After getcontext\n");
+  ret = syscall(SYS_arch_prctl, ARCH_SET_FS, app_fs);
+  patchAuxv(auxvec, 0, 0, 0);
   // foo();
 
   return 0;
@@ -155,26 +225,42 @@ int main(int argc, char **argv, char **envp)
 
 #define ROUND_UP(addr) ((addr + getpagesize() - 1) & ~(getpagesize()-1))
 #define ROUND_DOWN(addr) ((unsigned long)addr & ~(getpagesize()-1))
-void read_proxy_bits(int childpid) {
-  struct iovec remote_iov[2];
+void read_proxy_bits(int childpid)
+{
+  struct iovec remote_iov[4];
   // text segment
+  fprintf(stderr, "Segment-0 [%x:%x] from proxy\n", segment_address[0], (unsigned long)segment_address[0] + (unsigned long)segment_address[5]);
   remote_iov[0].iov_base = segment_address[0];
   // FIXME:  For now, use this current size of text.  Must be fiex.
   remote_iov[0].iov_len = (size_t)segment_address[5];
   mmap_iov(&remote_iov[0], PROT_READ|PROT_EXEC|PROT_WRITE);
   // data segment
+  fprintf(stderr, "Segment-1 [%x:%x] from proxy\n", segment_address[1], segment_address[3]);
   remote_iov[1].iov_base = segment_address[1];
   remote_iov[1].iov_len = segment_address[3] - segment_address[1];
   mmap_iov(&remote_iov[1], PROT_READ|PROT_WRITE);
+  // RO data segment
+  fprintf(stderr, "Segment-2 [%x:%x] from proxy\n", segment_address[10], segment_address[11]);
+  remote_iov[2].iov_base = segment_address[10];
+  remote_iov[2].iov_len = segment_address[11] - segment_address[10];
+  mmap_iov(&remote_iov[2], PROT_READ | PROT_WRITE);
+  // RW data segment
+  fprintf(stderr, "Segment-3 [%x:%x] from proxy\n", segment_address[12], segment_address[13]);
+  remote_iov[3].iov_base = segment_address[12];
+  remote_iov[3].iov_len = segment_address[13] - segment_address[12];
+  mmap_iov(&remote_iov[3], PROT_READ | PROT_WRITE);
   // NOTE:  In our case loca_iov will be same as remote_iov.
   // NOTE:  This requires same privilege as ptrace_attach (valid for child)
-  int rc = process_vm_readv(childpid, remote_iov, 1, remote_iov, 1, 0);
-  if (rc == -1) {
-    perror("process_vm_readv"); exit(1);
-  }
-  rc = process_vm_readv(childpid, remote_iov+1, 1, remote_iov+1, 1, 0);
-  if (rc == -1) {
-    perror("process_vm_readv"); exit(1);
+  for (int i = 0; i < 4; i++) {
+    fprintf(stderr, "Reading segment-%d [%x:%x] from proxy\n", i, remote_iov[i].iov_base, remote_iov[i].iov_len);
+    int rc = process_vm_readv(childpid, remote_iov + i, 1, remote_iov + i, 1, 0);
+    if (rc == -1) {
+      perror("process_vm_readv"); exit(1);
+    }
+  // rc = process_vm_readv(childpid, remote_iov+1, 1, remote_iov+1, 1, 0);
+  // if (rc == -1) {
+  //   perror("process_vm_readv"); exit(1);
+  // }
   }
 
   // Can remove PROT_WRITE now that we've oppulated the text segment.
