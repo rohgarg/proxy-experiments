@@ -16,6 +16,11 @@
 #include <link.h>
 #include <sys/auxv.h>
 #include <ucontext.h>
+#include <mpi.h>
+#include <string.h>
+#include <sys/personality.h>
+
+#include "libproxy.h"
 
 void read_proxy_bits(int childpid);
 void mmap_iov(const struct iovec *iov, int prot);
@@ -48,6 +53,8 @@ typedef int (*libcFptr_t) (int (*main) (int, char **, char ** MAIN_AUXVEC_DECL),
 			    void (*fini) (void),
 			    void (*rtld_fini) (void),
 			    void *);
+
+typedef void* (*proxyDlsym_t)(enum MPI_Fncs fnc);
 
 static unsigned long
 getStackPtr()
@@ -134,17 +141,56 @@ patchAuxv (ElfW(auxv_t) *av, unsigned long phnum, unsigned long phdr, int save)
   }
 }
 
+char **copyArgv(int argc, char **argv)
+{
+  char **new_argv = malloc((argc+1) * sizeof *new_argv);
+  for(int i = 0; i < argc; ++i)
+  {
+      size_t length = strlen(argv[i])+1;
+      new_argv[i] = malloc(length);
+      memcpy(new_argv[i], argv[i], length);
+  }
+  new_argv[argc] = NULL;
+  return new_argv;
+}
+
 void *segment_address[100];
   // Will be read from child (from original proxy)
   // Values are:  {&_start, &__data_start, &_edata, sbrk(0), ...}
   // Allocate extra space, for future growth
 
+proxyDlsym_t pdlsym;
+
+#define NEXT_FNC(func)                                                                \
+  ({                                                                                  \
+    static __typeof__(&MPI_##func)_real_MPI_## func = (__typeof__(&MPI_##func)) - 1;  \
+    if (_real_MPI_ ## func == (__typeof__(&MPI_##func)) - 1) {                        \
+      _real_MPI_ ## func = (__typeof__(&MPI_##func))pdlsym(MPI_Fnc_##func);           \
+    }                                                                                 \
+    _real_MPI_ ## func;                                                               \
+  })
+
+#define _real_MPI_Init       NEXT_FNC(Init)
+#define _real_MPI_Finalize   NEXT_FNC(Finalize)
+#define _real_MPI_Comm_size  NEXT_FNC(Comm_size)
+#define _real_MPI_Comm_rank  NEXT_FNC(Comm_rank)
 
 int main(int argc, char **argv, char **envp)
 {
   int pipefd[2];
 
+  if (strstr(argv[0], "copy-bits-norandom")) {
+    char buf[strlen(argv[0])];
+    memset(buf, 0, sizeof buf);
+    readlink(argv[0], buf, sizeof buf);
+    char **newArgv = copyArgv(argc, argv);
+    newArgv[0] = buf;
+    personality(ADDR_NO_RANDOMIZE);
+    execvp(newArgv[0], newArgv);
+  }
+
   pipe(pipefd);
+  printf("Upper half's sbrk: %p\n", sbrk(0));
   int childpid = fork();
 
   if (childpid > 0) { // if parent
@@ -162,7 +208,7 @@ int main(int argc, char **argv, char **envp)
     char buf[10];
     snprintf(buf, sizeof buf, "%d", pipefd[1]); // write end of pipe
     args[1] = buf;
-    execvp("./proxy", args);
+    execvp("./proxy-norandom", args);
     perror("execvp"); // shouldn't reach here
     exit(1);
   } else {
@@ -196,8 +242,7 @@ int main(int argc, char **argv, char **envp)
   ElfW(auxv_t) *auxvec;
   {
     char **evp = ev;
-    while (*evp++ != NULL)
-      ;
+    while (*evp++ != NULL);
     auxvec = (ElfW(auxv_t) *) evp;
   }
   patchAuxv(auxvec,
@@ -205,6 +250,7 @@ int main(int argc, char **argv, char **envp)
             (unsigned long)segment_address[16],
             1);
   int flag = 0;
+  fprintf(stderr, "App: setting app context to %p\n", segment_address[17]);
   ret = getcontext((ucontext_t*)segment_address[17]);
   if (ret < 0) {
     perror("getcontext");
@@ -218,6 +264,15 @@ int main(int argc, char **argv, char **envp)
   fprintf(stderr, "After getcontext\n");
   ret = syscall(SYS_arch_prctl, ARCH_SET_FS, app_fs);
   patchAuxv(auxvec, 0, 0, 0);
+  pdlsym = segment_address[18];
+  ret = syscall(SYS_arch_prctl, ARCH_SET_FS, proxy_fs);
+  ret = _real_MPI_Init(&argc, &argv);
+  int world_size, world_rank;
+  ret = _real_MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  ret = _real_MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  fprintf(stderr, "[%d/%d] Hello World!\n", world_rank, world_size);
+  ret = _real_MPI_Finalize();
+  ret = syscall(SYS_arch_prctl, ARCH_SET_FS, app_fs);
   // foo();
 
   return 0;

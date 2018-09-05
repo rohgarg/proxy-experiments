@@ -2,16 +2,21 @@ FILE=proxy.c
 CFLAGS=-g3 -O0
 PROXY_LINKER_FLAGS=-Wl,-Ttext-segment -Wl,0x800000 \
                    -Wl,-Trodata-segment -Wl,0xb00000 \
-                   -Wl,-Tdata -Wl,0xd00000
+                   -Wl,-Tdata -Wl,0xf00000
 
 build: copy-bits proxy
 
 # This could be compiled -static or not, as we please.
-copy-bits: copy-bits.c
-	gcc ${CFLAGS} -o $@ $<
+copy-bits.o: copy-bits.c
+	mpicc ${CFLAGS} -c -o $@ $<
+
+copy-bits: copy-bits.o
+	gcc -o $@ $<
+	ln -sf ./$@ ./$@-norandom
 
 proxy: lastlib.o ${FILE} libproxy.a sbrk.o #  lastlib.o
 	gcc -static ${CFLAGS} ${PROXY_LINKER_FLAGS} -o $@ $^ -lmpi -lrt -lpthread -lc
+	ln -sf ./$@ ./proxy-norandom
 
 sbrk.o: sbrk.c
 	gcc ${CFLAGS} -o $@ -c $<
@@ -35,7 +40,7 @@ gdb: ${basename proxy.c ${FILE}}
 	$@ $<
 
 clean:
-	rm -f a.out proxy libproxy.{o,a} copy-bits sbrk.o lastlib.o
+	rm -f a.out proxy libproxy.{o,a} copy-bits sbrk.o lastlib.o copy-bits.o copy-bits-norandom proxy-norandom
 
 distclean: clean
 

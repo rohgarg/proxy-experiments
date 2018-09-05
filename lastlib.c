@@ -11,6 +11,10 @@
 #include <syscall.h>
 #include <sys/auxv.h>
 #include <ucontext.h>
+#include <sys/personality.h>
+#include <string.h>
+
+#include "libproxy.h"
 
 #define ROUND_UP(addr) ((addr + getpagesize() - 1) & ~(getpagesize()-1))
 
@@ -38,7 +42,8 @@ void *segment_address[] =
   {&_start, &__data_start, &_edata, NULL, &foo,
    NULL, &__libc_start_main, NULL, NULL, NULL,
    NULL, NULL, NULL, NULL,
-   NULL, NULL, NULL, NULL};
+   NULL, NULL, NULL, NULL,
+   NULL};
   // If we didn't want to use sbrk(), then &_bss_start is also available.
 
 ucontext_t appContext;
@@ -102,6 +107,19 @@ getTextSegmentRange(unsigned long *start,       // OUT
   *stackstart = startstack;
 }
 
+char **copyArgv(int argc, char **argv)
+{
+  char **new_argv = malloc((argc+1) * sizeof *new_argv);
+  for(int i = 0; i < argc; ++i)
+  {
+      size_t length = strlen(argv[i])+1;
+      new_argv[i] = malloc(length);
+      memcpy(new_argv[i], argv[i], length);
+  }
+  new_argv[argc] = NULL;
+  return new_argv;
+}
+
 __attribute__((constructor))
 void first_constructor()
 {
@@ -134,13 +152,20 @@ void first_constructor()
     int argc = *(int*)stackstart;
     char **argv = (char**)(stackstart + sizeof(unsigned long));
 
+    if (strstr(argv[0], "proxy-norandom")) {
+      char buf[strlen(argv[0])];
+      memset(buf, 0, sizeof buf);
+      readlink(argv[0], buf, sizeof buf);
+      char **newArgv = copyArgv(argc, argv);
+      newArgv[0] = buf;
+      personality(ADDR_NO_RANDOMIZE);
+      execvp(newArgv[0], newArgv);
+    }
+
     if (argc == 1) {// standalone if no pipefd
-      __libc_start_main(&main, *(int*)stackstart,
-                        (char**)(stackstart + sizeof(unsigned long)),
-                        &__libc_csu_init, &__libc_csu_fini, 0,
-                        (void*)(stackstart - sizeof(unsigned long)));
       return;
     }
+
     segment_address[0] = (void*)start;
     segment_address[5] = (void*)(end - start);
     segment_address[6] = &__libc_start_main;
@@ -158,6 +183,7 @@ void first_constructor()
     segment_address[15] = (void*)getauxval(AT_PHNUM);
     segment_address[16] = (void*)getauxval(AT_PHDR);
     segment_address[17] = (void*)&appContext;
+    segment_address[18] = (void*)&mydlsym;
     fprintf(stderr,
             "PROXY: _start, __data_start, _edata, END_OF_HEAP: %p, %p, %p, %p\n",
             segment_address[0], segment_address[1], segment_address[2],
@@ -168,7 +194,7 @@ void first_constructor()
     write(pipe_write, segment_address, addr_size);
     close(pipe_write);
     // Allow some time for parent to copy bits of child before we exit.
-    sleep(10);
+    sleep(2);
     exit(0);
   } else {
     printf("Constructor called for the second time here. Running in the parent.\n");
