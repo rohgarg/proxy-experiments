@@ -286,7 +286,6 @@ void read_proxy_bits(int childpid)
   // text segment
   fprintf(stderr, "Segment-0 [%x:%x] from proxy\n", segment_address[0], (unsigned long)segment_address[0] + (unsigned long)segment_address[5]);
   remote_iov[0].iov_base = segment_address[0];
-  // FIXME:  For now, use this current size of text.  Must be fiex.
   remote_iov[0].iov_len = (size_t)segment_address[5];
   mmap_iov(&remote_iov[0], PROT_READ|PROT_EXEC|PROT_WRITE);
   // data segment
